@@ -17,10 +17,17 @@ go build
 
 ## Docker Quick Start
 
+### Multi-Architecture Support
+
+Docker images are available for the following platforms:
+- `linux/amd64` (x86_64)
+- `linux/arm64` (ARM 64-bit)
+- `linux/arm/v7` (ARM 32-bit)
+
 ### Pull and Run from Docker Hub
 
 ```bash
-# Pull the latest image
+# Pull the latest image (automatically selects the correct architecture)
 docker pull ucnacdx2/lumine:latest
 
 # Run with default configuration
@@ -42,8 +49,14 @@ docker run -d \
 ### Build Docker Image Locally
 
 ```bash
-# Build the image
+# Build the image for your current platform
 docker build -t lumine:local .
+
+# Build for a specific platform (requires buildx)
+docker buildx build --platform linux/arm64 -t lumine:local-arm64 --load .
+
+# Build multi-platform images
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t lumine:local .
 
 # Run the locally built image
 docker run -d \
