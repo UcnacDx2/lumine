@@ -31,6 +31,7 @@ docker run -d \
   ucnacdx2/lumine:latest
 
 # Run with custom configuration
+# First, create a config.json file in your current directory (see Configuration section)
 docker run -d \
   --name lumine \
   -p 1080:1080 \
@@ -55,7 +56,30 @@ docker run -d \
 
 ### Docker Compose (Optional)
 
-Create a `docker-compose.yml` file:
+**Important:** Before using Docker Compose with a custom configuration, you must create a `config.json` file in your current directory. If this file doesn't exist, Docker will create a directory named `config.json` instead, which will cause a mount error.
+
+#### Steps:
+
+1. Create your configuration file:
+
+```bash
+# Copy the example configuration
+cp config.example.json config.json
+
+# Or create a minimal config.json manually
+cat > config.json << 'EOF'
+{
+    "socks5_address": "127.0.0.1:1080",
+    "http_address": "127.0.0.1:1225",
+    "dns_addr": "https://1.1.1.1/dns-query",
+    "default_policy": {
+        "mode": "tls-rf"
+    }
+}
+EOF
+```
+
+2. Create a `docker-compose.yml` file:
 
 ```yaml
 services:
@@ -70,11 +94,13 @@ services:
     restart: unless-stopped
 ```
 
-Then run:
+3. Run Docker Compose:
 
 ```bash
 docker-compose up -d
 ```
+
+**Note:** If you encounter an error like "not a directory: unknown: Are you trying to mount a directory onto a file", it means Docker created `config.json` as a directory. Remove it with `rm -rf config.json` and follow the steps above to create it as a file first.
 
 ## Configuration
 ### Top-Level Fields
