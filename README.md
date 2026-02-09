@@ -15,6 +15,68 @@ cd lumine
 go build
 ```
 
+## Docker Quick Start
+
+### Pull and Run from Docker Hub
+
+```bash
+# Pull the latest image
+docker pull ucnacdx2/lumine:latest
+
+# Run with default configuration
+docker run -d \
+  --name lumine \
+  -p 1080:1080 \
+  -p 1225:1225 \
+  ucnacdx2/lumine:latest
+
+# Run with custom configuration
+docker run -d \
+  --name lumine \
+  -p 1080:1080 \
+  -p 1225:1225 \
+  -v $(pwd)/config.json:/root/config.json \
+  ucnacdx2/lumine:latest
+```
+
+### Build Docker Image Locally
+
+```bash
+# Build the image
+docker build -t lumine:local .
+
+# Run the locally built image
+docker run -d \
+  --name lumine \
+  -p 1080:1080 \
+  -p 1225:1225 \
+  lumine:local
+```
+
+### Docker Compose (Optional)
+
+Create a `docker-compose.yml` file:
+
+```yaml
+version: '3.8'
+services:
+  lumine:
+    image: ucnacdx2/lumine:latest
+    container_name: lumine
+    ports:
+      - "1080:1080"
+      - "1225:1225"
+    volumes:
+      - ./config.json:/root/config.json
+    restart: unless-stopped
+```
+
+Then run:
+
+```bash
+docker-compose up -d
+```
+
 ## Configuration
 ### Top-Level Fields
 Field|Description|Example|Special Values
