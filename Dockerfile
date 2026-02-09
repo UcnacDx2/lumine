@@ -1,5 +1,9 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+# Build arguments for cross-compilation
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -12,8 +16,8 @@ RUN go mod download
 # Copy source code
 COPY *.go ./
 
-# Build the application for Linux x64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o lumine .
+# Build the application for the target platform
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o lumine .
 
 # Runtime stage
 FROM alpine:latest
