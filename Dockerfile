@@ -18,9 +18,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o lumi
 # Runtime stage
 FROM alpine:latest
 
-# Optional: Install ca-certificates if needed for HTTPS connections
-# RUN apk --no-cache add ca-certificates || true
-
 WORKDIR /root/
 
 # Copy binary from builder
