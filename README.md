@@ -15,6 +15,40 @@ cd lumine
 go build
 ```
 
+For Windows with system tray support:
+```
+go build -ldflags="-H windowsgui" -o lumine.exe
+```
+
+## Usage
+
+### Basic Usage
+
+Run lumine with default configuration:
+```bash
+./lumine
+```
+
+Run with custom configuration file:
+```bash
+./lumine -c /path/to/config.json
+```
+
+### Windows System Tray Mode
+
+On Windows, you can run lumine with a system tray icon that allows the application to run in the background:
+
+```bash
+lumine.exe -gui
+```
+
+Features of the system tray mode:
+- **Hide/Show Console**: Toggle the console window visibility using the system tray menu
+- **Background Operation**: The application runs minimized to the system tray
+- **Easy Exit**: Right-click the tray icon and select "Exit" to close the application
+
+Note: The `-gui` flag is only available on Windows. On other platforms, it will be ignored and the application will run normally.
+
 ## Docker Quick Start
 
 ### Multi-Architecture Support
