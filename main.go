@@ -15,11 +15,11 @@ func main() {
 	configPath := flag.String("c", "config.json", "Config file path")
 	addr := flag.String("b", "", "SOCKS5 bind address (default: address from config file)")
 	hAddr := flag.String("hb", "", "HTTP bind address (default: address from config file)")
-	guiMode := flag.Bool("gui", false, "Run with Windows system tray icon (Windows only)")
+	enableSystemTray := flag.Bool("gui", false, "Run with Windows system tray icon (Windows only)")
 
 	flag.Parse()
 
-	if *guiMode {
+	if *enableSystemTray {
 		// Run with system tray
 		runWithSystray(func() {
 			startServer(*configPath, addr, hAddr)

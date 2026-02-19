@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/getlantern/systray"
@@ -104,7 +105,11 @@ const (
 	SW_SHOW = 5
 )
 
-var consoleVisible = true
+var consoleVisible atomic.Bool
+
+func init() {
+	consoleVisible.Store(true)
+}
 
 func getConsoleWindow() (uintptr, error) {
 	hwnd, _, err := procGetConsoleWindow.Call()
@@ -119,8 +124,11 @@ func hideConsole() error {
 	if err != nil {
 		return err
 	}
-	procShowWindow.Call(hwnd, SW_HIDE)
-	consoleVisible = false
+	ret, _, err := procShowWindow.Call(hwnd, SW_HIDE)
+	if ret == 0 {
+		return err
+	}
+	consoleVisible.Store(false)
 	return nil
 }
 
@@ -129,16 +137,23 @@ func showConsole() error {
 	if err != nil {
 		return err
 	}
-	procShowWindow.Call(hwnd, SW_SHOW)
-	consoleVisible = true
+	ret, _, err := procShowWindow.Call(hwnd, SW_SHOW)
+	if ret == 0 {
+		return err
+	}
+	consoleVisible.Store(true)
 	return nil
 }
 
 func toggleConsole() {
-	if consoleVisible {
-		hideConsole()
+	if consoleVisible.Load() {
+		if err := hideConsole(); err != nil {
+			// Log error but continue
+		}
 	} else {
-		showConsole()
+		if err := showConsole(); err != nil {
+			// Log error but continue
+		}
 	}
 }
 
