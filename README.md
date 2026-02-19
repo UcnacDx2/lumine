@@ -44,8 +44,16 @@ lumine.exe -gui
 
 Features of the system tray mode:
 - **Hide/Show Console**: Toggle the console window visibility using the system tray menu
+- **Set System Proxy**: Configure Windows to use Lumine as the system proxy (applies to HTTP, HTTPS, and SOCKS protocols)
+- **Unset System Proxy**: Remove the system proxy configuration and restore direct connection
 - **Background Operation**: The application runs minimized to the system tray
 - **Easy Exit**: Right-click the tray icon and select "Exit" to close the application
+
+**System Proxy Details:**
+- When you set the system proxy, Windows will automatically route HTTP, HTTPS, and SOCKS traffic through Lumine
+- The proxy settings use the addresses configured in your `config.json` file
+- The system proxy can be toggled on/off at any time through the tray menu
+- Menu items are automatically enabled/disabled based on the current proxy state
 
 Note: The `-gui` flag is only available on Windows. On other platforms, it will be ignored and the application will run normally.
 
