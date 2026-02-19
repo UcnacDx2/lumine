@@ -3,11 +3,13 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/getlantern/systray"
+	"golang.org/x/sys/windows/registry"
 )
 
 // iconData is a simple 16x16 ICO file (network/proxy icon)
@@ -157,12 +159,121 @@ func toggleConsole() {
 	}
 }
 
+// Proxy configuration
+var (
+	proxyEnabled  atomic.Bool
+	socks5Address string
+	httpAddress   string
+	
+	wininet = syscall.NewLazyDLL("wininet.dll")
+	procInternetSetOptionW = wininet.NewProc("InternetSetOptionW")
+)
+
+const (
+	INTERNET_OPTION_SETTINGS_CHANGED = 39
+	INTERNET_OPTION_REFRESH          = 37
+)
+
+// setSystemProxy sets the Windows system proxy to use lumine
+func setSystemProxy() error {
+	key, err := registry.OpenKey(registry.CURRENT_USER, 
+		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, 
+		registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("failed to open registry key: %w", err)
+	}
+	defer key.Close()
+
+	// Enable proxy
+	if err := key.SetDWordValue("ProxyEnable", 1); err != nil {
+		return fmt.Errorf("failed to enable proxy: %w", err)
+	}
+
+	// Set proxy server address
+	// Format: http=host:port;https=host:port;socks=host:port
+	proxyServer := fmt.Sprintf("http=%s;https=%s;socks=%s", httpAddress, httpAddress, socks5Address)
+	if err := key.SetStringValue("ProxyServer", proxyServer); err != nil {
+		return fmt.Errorf("failed to set proxy server: %w", err)
+	}
+
+	// Notify system of proxy changes
+	notifyProxyChange()
+	
+	proxyEnabled.Store(true)
+	return nil
+}
+
+// unsetSystemProxy disables the Windows system proxy
+func unsetSystemProxy() error {
+	key, err := registry.OpenKey(registry.CURRENT_USER, 
+		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, 
+		registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("failed to open registry key: %w", err)
+	}
+	defer key.Close()
+
+	// Disable proxy
+	if err := key.SetDWordValue("ProxyEnable", 0); err != nil {
+		return fmt.Errorf("failed to disable proxy: %w", err)
+	}
+
+	// Notify system of proxy changes
+	notifyProxyChange()
+	
+	proxyEnabled.Store(false)
+	return nil
+}
+
+// notifyProxyChange notifies Windows that proxy settings have changed
+func notifyProxyChange() {
+	procInternetSetOptionW.Call(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+	procInternetSetOptionW.Call(0, INTERNET_OPTION_REFRESH, 0, 0)
+}
+
+// checkProxyStatus checks if the system proxy is currently enabled
+func checkProxyStatus() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, 
+		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, 
+		registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+
+	enabled, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil {
+		return false
+	}
+
+	return enabled == 1
+}
+
 func onReady() {
 	systray.SetIcon(iconData)
 	systray.SetTitle("Lumine Proxy")
 	systray.SetTooltip("Lumine HTTP/SOCKS5 Proxy Server")
 
+	// Check initial proxy status
+	if checkProxyStatus() {
+		proxyEnabled.Store(true)
+	}
+
 	mToggle := systray.AddMenuItem("Show/Hide Console", "Toggle console window visibility")
+	systray.AddSeparator()
+	
+	mSetProxy := systray.AddMenuItem("Set System Proxy", "Configure Windows to use Lumine proxy")
+	mUnsetProxy := systray.AddMenuItem("Unset System Proxy", "Remove Windows proxy configuration")
+	
+	// Update menu item states based on current proxy status
+	if proxyEnabled.Load() {
+		mSetProxy.Disable()
+		mUnsetProxy.Enable()
+	} else {
+		mSetProxy.Enable()
+		mUnsetProxy.Disable()
+	}
+	
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Exit", "Exit the application")
 
@@ -171,6 +282,22 @@ func onReady() {
 			select {
 			case <-mToggle.ClickedCh:
 				toggleConsole()
+			case <-mSetProxy.ClickedCh:
+				if err := setSystemProxy(); err != nil {
+					// Log error but continue
+					fmt.Printf("Failed to set system proxy: %v\n", err)
+				} else {
+					mSetProxy.Disable()
+					mUnsetProxy.Enable()
+				}
+			case <-mUnsetProxy.ClickedCh:
+				if err := unsetSystemProxy(); err != nil {
+					// Log error but continue
+					fmt.Printf("Failed to unset system proxy: %v\n", err)
+				} else {
+					mSetProxy.Enable()
+					mUnsetProxy.Disable()
+				}
 			case <-mQuit.ClickedCh:
 				systray.Quit()
 				return
@@ -184,7 +311,11 @@ func onExit() {
 	showConsole()
 }
 
-func runWithSystray(mainFunc func()) {
+func runWithSystray(socks5Addr, httpAddr string, mainFunc func()) {
+	// Store proxy addresses for system proxy configuration
+	socks5Address = socks5Addr
+	httpAddress = httpAddr
+	
 	// Hide console on startup when in GUI mode
 	hideConsole()
 	
