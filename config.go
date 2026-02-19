@@ -7,41 +7,50 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/elastic/go-freelru"
 	"github.com/miekg/dns"
 	"github.com/moi-si/addrtrie"
+	log "github.com/moi-si/mylog"
 	"golang.org/x/net/proxy"
 )
 
 type Config struct {
-	TransmitFileLimit int               `json:"transmit_file_limit"`
-	Socks5Addr        string            `json:"socks5_address"`
-	HttpAddr          string            `json:"http_address"`
-	DNSAddr           string            `json:"dns_addr"`
-	UDPSize           uint16            `json:"udp_minsize"`
-	DoHProxy          string            `json:"socks5_for_doh"`
-	MaxJump           uint8             `json:"max_jump"`
-	FakeTTLRules      string            `json:"fake_ttl_rules"`
-	DNSCacheTTL       int               `json:"dns_cache_ttl"`
-	TTLCacheTTL       int               `json:"ttl_cache_ttl"`
-	DefaultPolicy     Policy            `json:"default_policy"`
-	DomainPolicies    map[string]Policy `json:"domain_policies"`
-	IpPolicies        map[string]Policy `json:"ip_policies"`
+	LogLevel          string             `json:"log_level"`
+	TransmitFileLimit int                `json:"transmit_file_limit"`
+	Socks5Addr        string             `json:"socks5_address"`
+	HttpAddr          string             `json:"http_address"`
+	DNSAddr           string             `json:"dns_addr"`
+	UDPSize           uint16             `json:"udp_minsize"`
+	DoHProxy          string             `json:"socks5_for_doh"`
+	FakeTTLRules      string             `json:"fake_ttl_rules"`
+	DNSCacheTTL       int                `json:"dns_cache_ttl"`
+	DNSCacheCapacity  int                `json:"dns_cache_cap"`
+	TTLCacheTTL       int                `json:"ttl_cache_ttl"`
+	TTLCacheCapacity  int                `json:"ttl_cache_cap"`
+	IPPools           map[string]*IPPool `json:"ip_pools"`
+	DefaultPolicy     Policy             `json:"default_policy"`
+	DomainPolicies    map[string]Policy  `json:"domain_policies"`
+	IpPolicies        map[string]Policy  `json:"ip_policies"`
 }
 
 var (
+	logLevel      = log.INFO
 	defaultPolicy Policy
+	ipPools       map[string]*IPPool
 	sem           chan struct{}
 	dnsAddr       string
-	maxJump       uint8
 	calcTTL       func(int) (int, error)
-	domainMatcher *addrtrie.DomainMatcher[Policy]
-	ipMatcher     *addrtrie.BitTrie[Policy]
-	ipv6Matcher   *addrtrie.BitTrie6[Policy]
+	domainMatcher *addrtrie.DomainMatcher[*Policy]
+	ipMatcher     *addrtrie.BitTrie[*Policy]
+	ipv6Matcher   *addrtrie.BitTrie6[*Policy]
 )
 
 type rule struct {
@@ -155,26 +164,117 @@ func loadConfig(filePath string) (string, string, error) {
 		return "", "", err
 	}
 
+	if conf.LogLevel != "" {
+		switch strings.ToUpper(conf.LogLevel) {
+		case "DEBUG":
+			logLevel = log.DEBUG
+		case "INFO":
+			logLevel = log.INFO
+		case "ERROR":
+			logLevel = log.ERROR
+		default:
+			return "", "", errors.New("unknown log level: " + conf.LogLevel)
+		}
+	}
+
 	defaultPolicy = conf.DefaultPolicy
+	if len(conf.IPPools) != 0 {
+		ipPools = conf.IPPools
+		for tag, pool := range ipPools {
+			logger := log.New(os.Stdout, "<"+tag+">", log.LstdFlags, logLevel)
+			logger.Info("Testing...")
+			if err := pool.Init(logger); err != nil {
+				return "", "", fmt.Errorf("init ip pool %s: %w", tag, err)
+			}
+		}
+	}
+
+	if conf.DNSCacheTTL < 0 {
+		return "", "", errors.New("invalid dns_cache_ttl: " + strconv.Itoa(conf.DNSCacheTTL))
+	}
+	if conf.DNSCacheTTL != 0 {
+		if conf.DNSCacheCapacity < 1 {
+			return "", "", errors.New("invalid dns_cache_cap: " + strconv.Itoa(conf.DNSCacheCapacity))
+		}
+		dnsCache, err = freelru.NewSharded[string, string](uint32(conf.DNSCacheCapacity), hashStringXXHASH)
+		if err != nil {
+			return "", "", fmt.Errorf("init dns cache: %w", err)
+		}
+		dnsCacheEnabled = true
+		dnsCacheTTL = time.Duration(conf.DNSCacheTTL) * time.Second
+	}
+
+	if conf.TTLCacheTTL < 0 {
+		return "", "", errors.New("invalid ttl cache ttl: " + strconv.Itoa(conf.TTLCacheTTL))
+	}
+	if conf.TTLCacheTTL != 0 {
+		if conf.TTLCacheCapacity < 1 {
+			return "", "", errors.New("invalid ttl_cache_cap: " + strconv.Itoa(conf.TTLCacheCapacity))
+		}
+		ttlCache, err = freelru.NewSharded[string, int](uint32(conf.TTLCacheCapacity), hashStringXXHASH)
+		if err != nil {
+			return "", "", fmt.Errorf("init ttl cache: %w", err)
+		}
+		ttlCacheEnabled = true
+		ttlCacheTTL = time.Duration(conf.TTLCacheTTL) * time.Second
+	}
+
+	if conf.FakeTTLRules != "" {
+		err = loadFakeTTLRules(conf.FakeTTLRules)
+		if err != nil {
+			return "", "", fmt.Errorf("load fake ttl rules: %w", err)
+		}
+		if runtime.GOOS == "windows" && conf.TransmitFileLimit > 0 {
+			sem = make(chan struct{}, conf.TransmitFileLimit)
+		}
+	}
+
+	domainMatcher = addrtrie.NewDomainMatcher[*Policy]()
+	for patterns, policy := range conf.DomainPolicies {
+		for elem := range strings.SplitSeq(patterns, ";") {
+			for _, pattern := range expandPattern(elem) {
+				domainMatcher.Add(pattern, &policy)
+			}
+		}
+	}
+
+	ipMatcher = addrtrie.NewBitTrie[*Policy]()
+	ipv6Matcher = addrtrie.NewBitTrie6[*Policy]()
+	for patterns, policy := range conf.IpPolicies {
+		for elem := range strings.SplitSeq(patterns, ";") {
+			for _, ipOrNet := range expandPattern(elem) {
+				if isIPv6(ipOrNet) {
+					ipv6Matcher.Insert(ipOrNet, &policy)
+				} else {
+					ipMatcher.Insert(ipOrNet, &policy)
+				}
+			}
+		}
+	}
 
 	dnsAddr = conf.DNSAddr
 	if strings.HasPrefix(dnsAddr, "https://") {
-		dnsQuery = dohQuery
+		var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 		if conf.DoHProxy == "" {
-			httpCli = new(http.Client)
+			dialContext, err = genDialContext()
+			if err != nil {
+				return "", "", err
+			}
 		} else {
 			dialer, err := proxy.SOCKS5("tcp", conf.DoHProxy, nil, proxy.Direct)
 			if err != nil {
-				return "", "", fmt.Errorf("create socks5 dialer: %s", err)
+				return "", "", fmt.Errorf("create socks5 dialer: %w", err)
 			}
-			dialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
-				return dialer.Dial(network, address)
+			dialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
 			}
-			transport := &http.Transport{DialContext: dialContext}
-			httpCli = &http.Client{Transport: transport}
 		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DialContext = dialContext
+		httpCli = &http.Client{Transport: transport}
+		dnsExchange = dohExchange
 	} else {
-		dnsQuery = do53Query
+		dnsExchange = do53Exchange
 		if conf.UDPSize == 0 {
 			dnsClient = new(dns.Client)
 		} else {
@@ -182,70 +282,133 @@ func loadConfig(filePath string) (string, string, error) {
 		}
 	}
 
-	if conf.DNSCacheTTL < -1 {
-		conf.DNSCacheTTL = 0
-	}
-	if conf.DNSCacheTTL != 0 {
-		dnsCacheEnabled = true
-		dnsCacheTTL = conf.DNSCacheTTL
-	}
+	return conf.Socks5Addr, conf.HttpAddr, nil
+}
 
-	if conf.MaxJump == 0 {
-		maxJump = 20
-	} else {
-		maxJump = conf.MaxJump
+func getIPPolicy(ip string) (*Policy, bool) {
+	if isIPv6(ip) {
+		return ipv6Matcher.Find(ip)
 	}
+	return ipMatcher.Find(ip)
+}
 
-	if conf.TTLCacheTTL < -1 {
-		conf.TTLCacheTTL = 0
-	}
-	if conf.TTLCacheTTL != 0 {
-		ttlCacheEnabled = true
-		ttlCacheTTL = conf.TTLCacheTTL
-	}
+var dohConnPolicy *Policy
 
-	if conf.FakeTTLRules != "" {
-		err = loadFakeTTLRules(conf.FakeTTLRules)
+type interceptConn struct {
+	net.Conn
+	handled bool
+}
+
+func (c *interceptConn) Write(b []byte) (n int, err error) {
+	if c.handled {
+		return c.Conn.Write(b)
+	}
+	c.handled = true
+	switch dohConnPolicy.Mode {
+	case ModeBlock, ModeTLSAlert:
+		return 0, errors.New("blocked by policy")
+	case ModeTTLD:
+		return 0, errors.ErrUnsupported
+	}
+	var sniPos, sniLen int
+	var hasKeyShare bool
+	_, sniPos, sniLen, hasKeyShare, err = parseClientHello(b)
+	if err != nil {
+		return
+	}
+	if dohConnPolicy.TLS13Only == BoolTrue && !hasKeyShare {
+		return 0, errors.New("not a TLS 1.3 ClientHello")
+	}
+	if sniPos == -1 {
+		return c.Conn.Write(b)
+	}
+	switch dohConnPolicy.Mode {
+	case ModeDirect, ModeRaw:
+		return c.Conn.Write(b)
+	case ModeTLSRF:
+		err = sendRecords(c.Conn, b, sniPos, sniLen,
+			dohConnPolicy.NumRecords, dohConnPolicy.NumSegments,
+			dohConnPolicy.OOB == BoolTrue, dohConnPolicy.ModMinorVer == BoolTrue,
+			dohConnPolicy.SendInterval)
+	}
+	if err == nil {
+		n = len(b)
+	}
+	return
+}
+
+func genDialContext() (func(ctx context.Context, network, address string) (net.Conn, error), error) {
+	parsedURL, err := url.Parse(dnsAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid DoH URL: %w", err)
+	}
+	host := parsedURL.Hostname()
+	dohConnPolicy = new(Policy)
+	if net.ParseIP(host) != nil {
+		var ipPolicy *Policy
+		host, ipPolicy, err = ipRedirect(nil, host)
+		if ipPolicy == nil {
+			dohConnPolicy = &defaultPolicy
+		} else {
+			p := mergePolicies(ipPolicy, &defaultPolicy)
+			dohConnPolicy = &p
+		}
 		if err != nil {
-			return "", "", fmt.Errorf("load fake ttl rules: %s", err)
+			return nil, fmt.Errorf("ip redirect: %w", err)
 		}
-		if runtime.GOOS == "windows" && conf.TransmitFileLimit > 0 {
-			sem = make(chan struct{}, conf.TransmitFileLimit)
+	} else {
+		var disableRedirect bool
+		domainPolicy, found := domainMatcher.Find(host)
+		if found {
+			p := mergePolicies(domainPolicy, &defaultPolicy)
+			dohConnPolicy = &p
+		} else {
+			dohConnPolicy = &defaultPolicy
 		}
-	}
-
-	domainMatcher = addrtrie.NewDomainMatcher[Policy]()
-	for patterns, policy := range conf.DomainPolicies {
-		p := policy
-		for elem := range strings.SplitSeq(patterns, ";") {
-			for _, pattern := range expandPattern(elem) {
-				domainMatcher.Add(pattern, p)
+		if dohConnPolicy.Host != nil && *dohConnPolicy.Host != "" {
+			disableRedirect = (*dohConnPolicy.Host)[0] == '^'
+			if disableRedirect {
+				host = (*dohConnPolicy.Host)[1:]
+			} else {
+				host = *dohConnPolicy.Host
 			}
-		}
-	}
-
-	ipMatcher = addrtrie.NewBitTrie[Policy]()
-	ipv6Matcher = addrtrie.NewBitTrie6[Policy]()
-	for patterns, policy := range conf.IpPolicies {
-		p := policy
-		for elem := range strings.SplitSeq(patterns, ";") {
-			for _, ipOrNet := range expandPattern(elem) {
-				if strings.Contains(ipOrNet, ":") {
-					ipv6Matcher.Insert(ipOrNet, p)
-				} else {
-					ipMatcher.Insert(ipOrNet, p)
+			if strings.HasPrefix(host, tagPrefix) {
+				if host, err = getFromIPPool(host[1:]); err != nil {
+					return nil, err
+				}
+			}
+			if !disableRedirect {
+				var ipPolicy *Policy
+				host, ipPolicy, err = ipRedirect(nil, host)
+				if err != nil {
+					return nil, fmt.Errorf("ip redirect: %w", err)
+				}
+				if ipPolicy != nil {
+					var p Policy
+					if found {
+						p = mergePolicies(domainPolicy, ipPolicy, &defaultPolicy)
+					} else {
+						p = mergePolicies(ipPolicy, &defaultPolicy)
+					}
+					dohConnPolicy = &p
 				}
 			}
 		}
 	}
-
-	return conf.Socks5Addr, conf.HttpAddr, nil
-}
-
-func getIPPolicy(ip string) *Policy {
-	if strings.Contains(ip, ":") {
-		policy, _ := ipv6Matcher.Find(ip)
-		return policy
+	port := parsedURL.Port()
+	if port == "" {
+		port = "443"
 	}
-	return ipMatcher.Find(ip)
+	if dohConnPolicy.Port != unsetInt {
+		port = strconv.FormatInt(int64(dohConnPolicy.Port), 10)
+	}
+	addr := net.JoinHostPort(host, port)
+	dialer := &net.Dialer{Timeout: dohConnPolicy.ConnectTimeout}
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return &interceptConn{Conn: conn}, nil
+		}
+		return nil, err
+	}, nil
 }

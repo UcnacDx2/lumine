@@ -11,21 +11,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func minReachableTTL(addr string, ipv6 bool, maxTTL, attempts int, dialTimeout time.Duration) (int, error) {
+const minInterval = 100 * time.Millisecond
+
+func minReachableTTL(addr string, ipv6 bool, maxTTL, attempts int, dialTimeout time.Duration) (int, bool, error) {
 	if ttlCacheEnabled {
-		lock := getLock(addr)
-		lock.Lock()
-		defer lock.Unlock()
-		v, ok := ttlCache.Load(addr)
-		if ok {
-			k := v.(ttlCacheEntry)
-			if !k.ExpireAt.IsZero() {
-				if time.Now().Before(k.ExpireAt) {
-					return k.TTL, nil
-				} else {
-					ttlCache.Delete(addr)
-				}
-			}
+		if ttl, ok := ttlCache.Get(addr); ok {
+			return ttl, true, nil
 		}
 	}
 
@@ -71,19 +62,10 @@ func minReachableTTL(addr string, ipv6 bool, maxTTL, attempts int, dialTimeout t
 	}
 
 	if ttlCacheEnabled && found != -1 {
-		var expireAt time.Time
-		if ttlCacheTTL == -1 {
-			expireAt = time.Time{}
-		} else {
-			expireAt = time.Now().Add(time.Duration(ttlCacheTTL * int(time.Second)))
-		}
-		ttlCache.Store(addr, ttlCacheEntry{
-			TTL:      found,
-			ExpireAt: expireAt,
-		})
+		ttlCache.AddWithLifetime(addr, found, dnsCacheTTL)
 	}
 
-	return found, nil
+	return found, false, nil
 }
 
 func sendFakeData(
@@ -170,20 +152,14 @@ func desyncSend(
 		fakeSleep = minInterval
 	}
 
-	cut := -1
-	for i := sniPos + sniLen; i >= sniPos; i-- {
-		if firstPacket[i] == '.' {
-			cut = i
-			break
-		}
-	}
+	cut, found := findLastDot(firstPacket, sniPos, sniLen)
 	var fakeData []byte
-	if cut == -1 {
-		cut = sniLen/2 + sniPos
-		fakeData = firstPacket[:cut]
-	} else {
+	if found {
 		fakeData = make([]byte, cut)
 		copy(fakeData, firstPacket[:sniPos])
+	} else {
+		cut = sniLen/2 + sniPos
+		fakeData = firstPacket[:cut]
 	}
 
 	err = sendFakeData(

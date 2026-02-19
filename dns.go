@@ -2,182 +2,195 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
+	"github.com/elastic/go-freelru"
 	"github.com/miekg/dns"
 )
+
+type DNSMode uint8
+
+const (
+	DNSModeUnknown DNSMode = iota
+	DNSModePreferIPv4
+	DNSModePreferIPv6
+	DNSModeIPv4Only
+	DNSModeIPv6Only
+	DNSModeDefault = DNSModePreferIPv4
+)
+
+func (m DNSMode) String() string {
+	switch m {
+	case DNSModePreferIPv4:
+		return "prefer_ipv4"
+	case DNSModePreferIPv6:
+		return "prefer_ipv6"
+	case DNSModeIPv4Only:
+		return "ipv4_only"
+	case DNSModeIPv6Only:
+		return "ipv6_only"
+	}
+	return "unknown"
+}
+
+func (m *DNSMode) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	switch s {
+	case "prefer_ipv4":
+		*m = DNSModePreferIPv4
+	case "prefer_ipv6":
+		*m = DNSModePreferIPv6
+	case "ipv4_only":
+		*m = DNSModeIPv4Only
+	case "ipv6_only":
+		*m = DNSModeIPv6Only
+	default:
+		return errors.New("invalid dns_mode: " + s)
+	}
+	return nil
+}
 
 var (
 	dnsClient       *dns.Client
 	httpCli         *http.Client
-	dnsQuery        func(string, uint16) (string, bool, error)
+	dnsExchange     func(req *dns.Msg) (resp *dns.Msg, err error)
 	dnsCacheEnabled bool
-	dnsCache        sync.Map
-	dnsCacheTTL     int
+	dnsCache        *freelru.ShardedLRU[string, string]
+	dnsCacheTTL     time.Duration
 )
 
-type dnsCacheEntry struct {
-	IP       string
-	ExpireAt time.Time
+func do53Exchange(req *dns.Msg) (resp *dns.Msg, err error) {
+	resp, _, err = dnsClient.Exchange(req, dnsAddr)
+	return resp, err
 }
 
-func do53Query(domain string, qtype uint16) (string, bool, error) {
-	if dnsCacheEnabled {
-		lock := getLock(domain)
-		lock.Lock()
-		defer lock.Unlock()
-		v, ok := dnsCache.Load(domain)
-		if ok {
-			k := v.(dnsCacheEntry)
-			if !k.ExpireAt.IsZero() {
-				if time.Now().Before(k.ExpireAt) {
-					return k.IP, true, nil
-				} else {
-					dnsCache.Delete(domain)
-				}
-			}
-		}
-	}
-
-	msg := new(dns.Msg)
-	msg.SetQuestion(domain+".", qtype)
-	resp, _, err := dnsClient.Exchange(msg, dnsAddr)
+func dohExchange(req *dns.Msg) (resp *dns.Msg, err error) {
+	wire, err := req.Pack()
 	if err != nil {
-		return "", false, fmt.Errorf("dns exchange: %s", err)
-	}
-	if resp.Rcode != dns.RcodeSuccess {
-		return "", false, fmt.Errorf("bad rcode: %s", dns.RcodeToString[resp.Rcode])
-	}
-
-	var ip string
-loop:
-	for _, ans := range resp.Answer {
-		switch qtype {
-		case dns.TypeA:
-			if record, ok := ans.(*dns.A); ok {
-				ip = record.A.String()
-				break loop
-			}
-		case dns.TypeAAAA:
-			if record, ok := ans.(*dns.AAAA); ok {
-				ip = record.AAAA.String()
-				break loop
-			}
-		}
-	}
-	if ip == "" {
-		return "", false, errors.New("record not found")
-	}
-	if dnsCacheEnabled {
-		var expireAt time.Time
-		if dnsCacheTTL == -1 {
-			expireAt = time.Time{}
-		} else {
-			expireAt = time.Now().Add(time.Duration(dnsCacheTTL * int(time.Second)))
-		}
-		dnsCache.Store(domain, dnsCacheEntry{
-			IP:       ip,
-			ExpireAt: expireAt,
-		})
-	}
-	return ip, false, nil
-}
-
-func dohQuery(domain string, qtype uint16) (string, bool, error) {
-	if dnsCacheEnabled {
-		lock := getLock(domain)
-		lock.Lock()
-		defer lock.Unlock()
-		v, ok := dnsCache.Load(domain)
-		if ok {
-			k := v.(dnsCacheEntry)
-			if !k.ExpireAt.IsZero() {
-				if time.Now().Before(k.ExpireAt) {
-					return k.IP, true, nil
-				} else {
-					dnsCache.Delete(domain)
-				}
-			}
-		}
-	}
-
-	msg := new(dns.Msg)
-	msg.SetQuestion(domain+".", qtype)
-	wire, err := msg.Pack()
-	if err != nil {
-		return "", false, fmt.Errorf("pack dns request: %s", err)
+		return nil, fmt.Errorf("pack dns request: %w", err)
 	}
 	b64 := base64.RawURLEncoding.EncodeToString(wire)
-	u := fmt.Sprintf("%s?dns=%s", dnsAddr, b64)
+	u := dnsAddr + "?dns=" + b64
 	httpReq, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
-		return "", false, fmt.Errorf("build http request: %s", err)
+		return nil, fmt.Errorf("build http request: %w", err)
 	}
 	httpReq.Header.Set("Accept", "application/dns-message")
-	resp, err := httpCli.Do(httpReq)
+	httpResp, err := httpCli.Do(httpReq)
 	if err != nil {
-		return "", false, fmt.Errorf("http request: %s", err)
+		return nil, fmt.Errorf("http request: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", false, fmt.Errorf("bad http status: %s", resp.Status)
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad http status: %s", httpResp.Status)
 	}
-	respWire, err := io.ReadAll(resp.Body)
+	respWire, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return "", false, fmt.Errorf("read http body: %s", err)
+		return nil, fmt.Errorf("read http body: %w", err)
 	}
-	ans := new(dns.Msg)
-	if err := ans.Unpack(respWire); err != nil {
-		return "", false, fmt.Errorf("unpack dns response: %s", err)
+	resp = new(dns.Msg)
+	if err = resp.Unpack(respWire); err != nil {
+		return nil, fmt.Errorf("unpack dns response: %w", err)
 	}
-	if ans.Rcode != dns.RcodeSuccess {
-		return "", false, fmt.Errorf("bad rcode: %s", dns.RcodeToString[ans.Rcode])
-	}
-
-	var ip string
-loop:
-	for _, ans := range ans.Answer {
-		switch qtype {
-		case dns.TypeA:
-			if record, ok := ans.(*dns.A); ok {
-				ip = record.A.String()
-				break loop
-			}
-		case dns.TypeAAAA:
-			if record, ok := ans.(*dns.AAAA); ok {
-				ip = record.AAAA.String()
-				break loop
-			}
-		}
-	}
-	if ip == "" {
-		return "", false, errors.New("record not found")
-	} else {
-		if dnsCacheEnabled {
-			var expireAt time.Time
-			if dnsCacheTTL == -1 {
-				expireAt = time.Time{}
-			} else {
-				expireAt = time.Now().Add(time.Duration(dnsCacheTTL * int(time.Second)))
-			}
-			dnsCache.Store(domain, dnsCacheEntry{
-				IP:       ip,
-				ExpireAt: expireAt,
-			})
-		}
-		return ip, false, nil
-	}
+	return
 }
 
-func doubleQuery(domain string, first, second uint16) (ip string, cached bool, err1, err2 error) {
-	ip, cached, err1 = dnsQuery(domain, first)
-	if err1 != nil {
-		ip, cached, err2 = dnsQuery(domain, second)
+func pickFirstARecord(answer []dns.RR) string {
+	for _, ans := range answer {
+		if record, ok := ans.(*dns.A); ok {
+			return record.A.String()
+		}
+	}
+	return ""
+}
+
+func pickFirstAAAARecord(answer []dns.RR) string {
+	for _, ans := range answer {
+		if record, ok := ans.(*dns.AAAA); ok {
+			return record.AAAA.String()
+		}
+	}
+	return ""
+}
+
+func dnsResolve(domain string, dnsMode DNSMode) (ip string, cached bool, err error) {
+	if dnsCacheEnabled {
+		if ip, ok := dnsCache.Get(domain); ok {
+			return ip, true, nil
+		}
+	}
+
+	msg := new(dns.Msg)
+	switch dnsMode {
+	case DNSModePreferIPv4, DNSModeIPv4Only:
+		msg.SetQuestion(domain+".", dns.TypeA)
+	case DNSModePreferIPv6, DNSModeIPv6Only:
+		msg.SetQuestion(domain+".", dns.TypeAAAA)
+	}
+
+	resp, err := dnsExchange(msg)
+	if err != nil {
+		return "", false, fmt.Errorf("dns exchange: %w", err)
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return "", false, errors.New("bad rcode: " + dns.RcodeToString[resp.Rcode])
+	}
+
+	switch dnsMode {
+	case DNSModeIPv4Only:
+		ip = pickFirstARecord(resp.Answer)
+		if ip == "" {
+			return "", false, errors.New("A record not found")
+		}
+	case DNSModeIPv6Only:
+		ip = pickFirstAAAARecord(resp.Answer)
+		if ip == "" {
+			return "", false, errors.New("AAAA record not found")
+		}
+	case DNSModePreferIPv4:
+		ip = pickFirstARecord(resp.Answer)
+		if ip == "" {
+			msg.SetQuestion(domain+".", dns.TypeAAAA)
+			resp, err2 := dnsExchange(msg)
+			if err2 != nil {
+				return "", false, fmt.Errorf("dns exchange: %w; %w", err, err2)
+			}
+			if resp.Rcode != dns.RcodeSuccess {
+				return "", false, fmt.Errorf("bad rcode: %s", dns.RcodeToString[resp.Rcode])
+			}
+			ip = pickFirstAAAARecord(resp.Answer)
+			if ip == "" {
+				return "", false, errors.New("record not found")
+			}
+		}
+	case DNSModePreferIPv6:
+		ip = pickFirstAAAARecord(resp.Answer)
+		if ip == "" {
+			msg.SetQuestion(domain+".", dns.TypeA)
+			resp, err2 := dnsExchange(msg)
+			if err2 != nil {
+				return "", false, fmt.Errorf("dns exchange: %w; %w", err, err2)
+			}
+			if resp.Rcode != dns.RcodeSuccess {
+				return "", false, fmt.Errorf("bad rcode: %s", dns.RcodeToString[resp.Rcode])
+			}
+			ip = pickFirstARecord(resp.Answer)
+			if ip == "" {
+				return "", false, errors.New("record not found")
+			}
+		}
+	}
+
+	if dnsCacheEnabled {
+		dnsCache.AddWithLifetime(domain, ip, dnsCacheTTL)
 	}
 	return
 }
