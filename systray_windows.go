@@ -164,7 +164,7 @@ var (
 	proxyEnabled  atomic.Bool
 	socks5Address string
 	httpAddress   string
-	
+
 	wininet = syscall.NewLazyDLL("wininet.dll")
 	procInternetSetOptionW = wininet.NewProc("InternetSetOptionW")
 )
@@ -198,7 +198,7 @@ func setSystemProxy() error {
 
 	// Notify system of proxy changes
 	notifyProxyChange()
-	
+
 	proxyEnabled.Store(true)
 	return nil
 }
@@ -220,15 +220,21 @@ func unsetSystemProxy() error {
 
 	// Notify system of proxy changes
 	notifyProxyChange()
-	
+
 	proxyEnabled.Store(false)
 	return nil
 }
 
 // notifyProxyChange notifies Windows that proxy settings have changed
 func notifyProxyChange() {
-	procInternetSetOptionW.Call(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
-	procInternetSetOptionW.Call(0, INTERNET_OPTION_REFRESH, 0, 0)
+	ret1, _, _ := procInternetSetOptionW.Call(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+	if ret1 == 0 {
+		fmt.Println("Warning: Failed to notify Windows of proxy settings change")
+	}
+	ret2, _, _ := procInternetSetOptionW.Call(0, INTERNET_OPTION_REFRESH, 0, 0)
+	if ret2 == 0 {
+		fmt.Println("Warning: Failed to refresh proxy settings")
+	}
 }
 
 // checkProxyStatus checks if the system proxy is currently enabled
@@ -261,10 +267,10 @@ func onReady() {
 
 	mToggle := systray.AddMenuItem("Show/Hide Console", "Toggle console window visibility")
 	systray.AddSeparator()
-	
+
 	mSetProxy := systray.AddMenuItem("Set System Proxy", "Configure Windows to use Lumine proxy")
 	mUnsetProxy := systray.AddMenuItem("Unset System Proxy", "Remove Windows proxy configuration")
-	
+
 	// Update menu item states based on current proxy status
 	if proxyEnabled.Load() {
 		mSetProxy.Disable()
@@ -273,7 +279,7 @@ func onReady() {
 		mSetProxy.Enable()
 		mUnsetProxy.Disable()
 	}
-	
+
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Exit", "Exit the application")
 
@@ -315,16 +321,16 @@ func runWithSystray(socks5Addr, httpAddr string, mainFunc func()) {
 	// Store proxy addresses for system proxy configuration
 	socks5Address = socks5Addr
 	httpAddress = httpAddr
-	
+
 	// Hide console on startup when in GUI mode
 	hideConsole()
-	
+
 	// Start the main proxy server in a goroutine
 	go mainFunc()
-	
+
 	// Run systray - this blocks until Quit is called
 	systray.Run(onReady, onExit)
-	
+
 	// After systray.Quit(), exit the application
 	os.Exit(0)
 }

@@ -19,22 +19,22 @@ func main() {
 
 	flag.Parse()
 
-	// Load config first to get the proxy addresses
-	socks5Addr, httpAddr, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Println("Failed to load config:", err)
-		return
-	}
-
-	// Override with command line flags if provided
-	if *addr != "" {
-		socks5Addr = *addr
-	}
-	if *hAddr != "" {
-		httpAddr = *hAddr
-	}
-
 	if *enableSystemTray {
+		// Load config to get the proxy addresses for the system tray
+		socks5Addr, httpAddr, err := loadConfig(*configPath)
+		if err != nil {
+			fmt.Println("Failed to load config:", err)
+			return
+		}
+
+		// Override with command line flags if provided
+		if *addr != "" {
+			socks5Addr = *addr
+		}
+		if *hAddr != "" {
+			httpAddr = *hAddr
+		}
+
 		// Run with system tray, passing the proxy addresses
 		runWithSystray(socks5Addr, httpAddr, func() {
 			startServer(*configPath, addr, hAddr)
