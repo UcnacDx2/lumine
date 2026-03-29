@@ -1,6 +1,17 @@
 # lumine
 A lightweight local HTTP/SOCKS5 proxy server that protects TLS connections over TCP.
 
+## How It Works
+
+Lumine uses advanced traffic manipulation techniques to bypass Deep Packet Inspection (DPI) systems:
+- **TLS Record Fragmentation (tls-rf)**: Splits TLS ClientHello into multiple records to evade SNI inspection
+- **TTL-based Desynchronization (ttl-d)**: Uses carefully crafted TTL values to send fake packets that confuse DPI systems
+- **Protocol Modifications**: Minor version changes and OOB data to bypass pattern matching
+
+📖 **For detailed explanations of the bypass mechanisms:**
+- [Bypass Mechanism Documentation (English)](BYPASS_MECHANISM.md)
+- [绕过机制详解（中文）](BYPASS_MECHANISM_CN.md)
+
 ## Installation
 
 ```
